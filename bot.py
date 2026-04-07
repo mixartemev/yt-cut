@@ -128,12 +128,17 @@ async def handle_stream(request: web.Request) -> web.Response:
     if "TelegramBot" in ua:
         thumb = f"https://img.youtube.com/vi/{v}/maxresdefault.jpg"
         title = _title_cache.get((v, start_f, end_f), "YouTube Clip")
+        self_url = str(request.url)
         html = (
             f'<meta property="og:type" content="video.other">'
             f'<meta property="og:image" content="{thumb}">'
             f'<meta property="og:image:width" content="1280">'
             f'<meta property="og:image:height" content="720">'
             f'<meta property="og:title" content="{title}">'
+            f'<meta property="og:video" content="{self_url}">'
+            f'<meta property="og:video:type" content="application/vnd.apple.mpegurl">'
+            f'<meta name="twitter:card" content="summary_large_image">'
+            f'<meta name="twitter:image" content="{thumb}">'
         )
         return web.Response(text=html, content_type="text/html")
 
