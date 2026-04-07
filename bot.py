@@ -39,6 +39,7 @@ VIDEO_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/emb
 _CACHE_TTL = 1800
 _url_cache: dict[str, tuple[str, float]] = {}
 _hls_cache: dict[tuple, tuple[str, float]] = {}
+_title_cache: dict[tuple, str] = {}
 
 
 # ── Clip server ──────────────────────────────────────────────────────────────
@@ -126,7 +127,7 @@ async def handle_stream(request: web.Request) -> web.Response:
     ua = request.headers.get("User-Agent", "")
     if "TelegramBot" in ua:
         thumb = f"https://img.youtube.com/vi/{v}/hqdefault.jpg"
-        title = request.query.get("title", "YouTube Clip")
+        title = _title_cache.get((v, start_f, end_f), "YouTube Clip")
         html = (
             f'<meta property="og:type" content="video.other">'
             f'<meta property="og:image" content="{thumb}">'
@@ -183,8 +184,11 @@ class ClipForm(StatesGroup):
 
 
 def parse_time(text: str) -> float:
-    """Parse 'мин:сек' (e.g. 8:54) to seconds."""
-    m = re.fullmatch(r"(\d+):(\d{1,2})", text.strip())
+    """Parse 'мин:сек' (e.g. 8:54) or '0' to seconds."""
+    text = text.strip()
+    if text == "0":
+        return 0
+    m = re.fullmatch(r"(\d+):(\d{1,2})", text)
     if not m:
         raise ValueError
     minutes, seconds = int(m.group(1)), int(m.group(2))
@@ -245,9 +249,9 @@ async def process_title(message: Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
 
-    start, end = data["start"], data["end"]
-    base = f"{SERVICE_URL}/{data['v']}/{start}/{end}" if end else f"{SERVICE_URL}/{data['v']}/{start}"
-    clip_url = f"{base}?title={quote(title)}"
+    start, end, v = data["start"], data["end"], data["v"]
+    _title_cache[(v, float(start), float(end))] = title
+    clip_url = f"{SERVICE_URL}/{v}/{start}/{end}" if end else f"{SERVICE_URL}/{v}/{start}"
     share_url = f"https://t.me/share/url?url={quote(clip_url)}"
 
     kb = InlineKeyboardMarkup(
