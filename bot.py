@@ -288,8 +288,14 @@ async def process_url(message: Message, state: FSMContext):
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 
 
+async def handle_root(request: web.Request) -> web.Response:
+    me = await bot.get_me()
+    raise web.HTTPFound(f"https://t.me/{me.username}")
+
+
 async def main():
     app = web.Application()
+    app.router.add_get("/", handle_root)
     vid = r"{v:[a-zA-Z0-9_-]{11}}"
     app.router.add_get(f"/{vid}/{{start}}", handle_stream)
     app.router.add_get(f"/{vid}/{{start}}/{{end}}", handle_stream)
