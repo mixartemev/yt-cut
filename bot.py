@@ -10,6 +10,9 @@ Env vars:
 import os
 import re
 import asyncio
+import time
+import tempfile
+import shutil
 from urllib.parse import quote
 
 from dotenv import load_dotenv
@@ -31,94 +34,133 @@ PORT = int(os.environ.get("PORT", "8080"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+VIDEO_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)([a-zA-Z0-9_-]{11})")
+
+_CACHE_TTL = 1800
+_url_cache: dict[str, tuple[str, float]] = {}
+_hls_cache: dict[tuple, tuple[str, float]] = {}
+
 
 # ── Clip server ──────────────────────────────────────────────────────────────
 
 
-def parse_youtube_url(url: str) -> str:
-    """Extract video ID and return canonical URL."""
-    m = re.search(
-        r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)([a-zA-Z0-9_-]{11})",
-        url,
+async def _resolve(video_id: str) -> str:
+    now = time.time()
+    cached = _url_cache.get(video_id)
+    if cached and now - cached[1] < _CACHE_TTL:
+        return cached[0]
+
+    proc = await asyncio.create_subprocess_exec(
+        "yt-dlp", "-f", "best[ext=mp4]/best", "-g",
+        f"https://www.youtube.com/watch?v={video_id}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    if not m:
-        raise ValueError(f"Invalid YouTube URL: {url}")
-    return f"https://www.youtube.com/watch?v={m.group(1)}"
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    if proc.returncode != 0:
+        raise RuntimeError(stderr.decode().strip())
+
+    url = stdout.decode().strip().splitlines()[0]
+    _url_cache[video_id] = (url, now)
+    return url
 
 
-async def handle_clip(request: web.Request) -> web.StreamResponse:
-    url = request.query.get("url")
+def _cleanup_hls():
+    now = time.time()
+    for key in [k for k, (_, ts) in _hls_cache.items() if now - ts > _CACHE_TTL]:
+        tmpdir, _ = _hls_cache.pop(key)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+async def _generate_hls(video_id: str, start: float, end: float) -> str:
+    key = (video_id, start, end)
+    _cleanup_hls()
+
+    cached = _hls_cache.get(key)
+    if cached:
+        return cached[0]
+
+    stream_url = await _resolve(video_id)
+    tmpdir = tempfile.mkdtemp(prefix="hls_")
+
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-ss", str(start),
+        "-i", stream_url,
+        "-t", str(end - start),
+        "-c", "copy",
+        "-f", "hls",
+        "-hls_time", "4",
+        "-hls_playlist_type", "vod",
+        "-hls_segment_filename", os.path.join(tmpdir, "seg%d.ts"),
+        "-loglevel", "error",
+        os.path.join(tmpdir, "stream.m3u8"),
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+
+    if proc.returncode != 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError(stderr.decode().strip())
+
+    _hls_cache[key] = (tmpdir, time.time())
+    return tmpdir
+
+
+async def handle_stream(request: web.Request) -> web.Response:
+    v = request.query.get("v")
     start = request.query.get("start")
     end = request.query.get("end")
 
-    if not url or start is None or end is None:
-        return web.json_response({"error": "Required params: url, start, end"}, status=400)
+    if not v or start is None or end is None:
+        return web.json_response({"error": "Required params: v, start, end"}, status=400)
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{11}", v):
+        return web.json_response({"error": "Invalid video ID"}, status=400)
 
     try:
         start_f, end_f = float(start), float(end)
     except ValueError:
         return web.json_response({"error": "start and end must be numbers"}, status=400)
-
     if end_f <= start_f:
         return web.json_response({"error": "end must be greater than start"}, status=400)
 
     try:
-        canonical = parse_youtube_url(url)
-    except ValueError as e:
-        return web.json_response({"error": str(e)}, status=400)
+        tmpdir = await _generate_hls(v, start_f, end_f)
+    except RuntimeError as e:
+        return web.json_response({"error": str(e)}, status=502)
 
-    # Resolve direct stream URL via yt-dlp
-    proc = await asyncio.create_subprocess_exec(
-        "yt-dlp",
-        "-f", "best[ext=mp4]/best", "-g", canonical,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    with open(os.path.join(tmpdir, "stream.m3u8")) as f:
+        m3u8 = f.read()
 
-    if proc.returncode != 0:
-        return web.json_response(
-            {"error": f"yt-dlp error: {stderr.decode().strip()}"}, status=502,
-        )
-
-    stream_url = stdout.decode().strip().splitlines()[0]
-    duration = end_f - start_f
-
-    # Stream clip via ffmpeg
-    ffmpeg = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-ss", str(start_f),
-        "-i", stream_url,
-        "-t", str(duration),
-        "-c", "copy",
-        "-movflags", "frag_keyframe+empty_moov",
-        "-f", "mp4",
-        "-loglevel", "error",
-        "pipe:1",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    # Rewrite local filenames to absolute URLs
+    m3u8 = re.sub(
+        r"seg(\d+)\.ts",
+        lambda m: f"{SERVICE_URL}/ts?v={v}&start={start_f}&end={end_f}&seg={m.group(1)}",
+        m3u8,
     )
 
-    resp = web.StreamResponse(
-        status=200,
-        headers={
-            "Content-Type": "video/mp4",
-            "Content-Disposition": "inline; filename=clip.mp4",
-        },
-    )
-    await resp.prepare(request)
+    return web.Response(text=m3u8, content_type="application/vnd.apple.mpegurl")
 
-    try:
-        while True:
-            chunk = await ffmpeg.stdout.read(64 * 1024)
-            if not chunk:
-                break
-            await resp.write(chunk)
-    finally:
-        ffmpeg.terminate()
-        await ffmpeg.wait()
 
-    return resp
+async def handle_ts(request: web.Request) -> web.Response:
+    v = request.query.get("v")
+    start = request.query.get("start")
+    end = request.query.get("end")
+    seg = request.query.get("seg")
+
+    if not v or start is None or end is None or seg is None:
+        return web.json_response({"error": "Required params: v, start, end, seg"}, status=400)
+
+    key = (v, float(start), float(end))
+    cached = _hls_cache.get(key)
+    if not cached:
+        return web.json_response({"error": "Session expired, reload playlist"}, status=404)
+
+    ts_path = os.path.join(cached[0], f"seg{seg}.ts")
+    if not os.path.isfile(ts_path):
+        return web.json_response({"error": "Segment not found"}, status=404)
+
+    return web.FileResponse(ts_path, headers={"Content-Type": "video/mp2t"})
 
 
 # ── Telegram bot ─────────────────────────────────────────────────────────────
@@ -182,7 +224,7 @@ async def process_end(message: Message, state: FSMContext):
 
     await state.clear()
 
-    clip_url = f"{SERVICE_URL}/clip?url={quote(data['url'])}&start={start}&end={end}"
+    clip_url = f"{SERVICE_URL}/stream?v={data['v']}&start={start}&end={end}"
     share_url = f"https://t.me/share/url?url={quote(clip_url)}"
 
     kb = InlineKeyboardMarkup(
@@ -195,14 +237,11 @@ async def process_end(message: Message, state: FSMContext):
 
 @dp.message()
 async def process_url(message: Message, state: FSMContext):
-    url = message.text.strip()
-    if not re.search(
-        r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)[a-zA-Z0-9_-]{11}",
-        url,
-    ):
+    m = VIDEO_ID_RE.search(message.text.strip())
+    if not m:
         await message.answer("Отправьте ссылку на YouTube ролик:")
         return
-    await state.update_data(url=url)
+    await state.update_data(v=m.group(1))
     await state.set_state(ClipForm.start)
     await message.answer("Введите время начала в формате мин:сек (например 8:54):")
 
@@ -212,7 +251,8 @@ async def process_url(message: Message, state: FSMContext):
 
 async def main():
     app = web.Application()
-    app.router.add_get("/clip", handle_clip)
+    app.router.add_get("/stream", handle_stream)
+    app.router.add_get("/ts", handle_ts)
 
     runner = web.AppRunner(app)
     await runner.setup()
