@@ -184,7 +184,7 @@ class ClipForm(StatesGroup):
 
 
 def parse_time(text: str) -> float:
-    """Parse 'мин:сек' (e.g. 8:54) or '0' to seconds."""
+    """Parse 'min:sec' (e.g. 8:54) or '0' to seconds."""
     text = text.strip()
     if text == "0":
         return 0
@@ -216,11 +216,11 @@ async def process_start(message: Message, state: FSMContext):
     try:
         start = parse_time(message.text)
     except ValueError:
-        await message.answer("Некорректный формат. Введите время как мин:сек (например 8:54):")
+        await message.answer("Некорректный формат. Введите время как min:sec (например 8:54):")
         return
     await state.update_data(start=start)
     await state.set_state(ClipForm.end)
-    await message.answer("Введите время конца в формате мин:сек (например 10:30):")
+    await message.answer("Введите время конца в формате min:sec (например 10:30 или 0, если до конца):")
 
 
 @dp.message(ClipForm.end)
@@ -228,7 +228,7 @@ async def process_end(message: Message, state: FSMContext):
     try:
         end = parse_time(message.text)
     except ValueError:
-        await message.answer("Некорректный формат. Введите время как мин:сек (например 10:30 или 0:00):")
+        await message.answer("Некорректный формат. Введите время как min:sec (например 10:30 или 0):")
         return
 
     data = await state.get_data()
@@ -275,7 +275,7 @@ async def process_url(message: Message, state: FSMContext):
         return
     await state.update_data(v=m.group(1))
     await state.set_state(ClipForm.start)
-    await message.answer("Введите время начала в формате мин:сек (например 8:54):")
+    await message.answer("Введите время начала в формате min:sec (например 8:54 или 0, если с самого начала):")
 
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
