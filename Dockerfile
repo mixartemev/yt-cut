@@ -4,6 +4,6 @@ RUN apt update; apt install -y --no-install-recommends ffmpeg; rm -rf /var/lib/a
 WORKDIR /app
 COPY pyproject.toml .
 RUN pip install --no-cache-dir .
-COPY bot.py .
+#COPY bot.py .
 
 CMD ["python", "bot.py"]
