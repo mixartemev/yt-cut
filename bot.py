@@ -108,14 +108,12 @@ async def _generate_hls(video_id: str, start: float, end: float) -> str:
 
 
 async def handle_stream(request: web.Request) -> web.Response:
-    v = request.query.get("v")
+    v = request.match_info["v"]
     start = request.query.get("start")
     end = request.query.get("end")
 
-    if not v or start is None or end is None:
-        return web.json_response({"error": "Required params: v, start, end"}, status=400)
-    if not re.fullmatch(r"[a-zA-Z0-9_-]{11}", v):
-        return web.json_response({"error": "Invalid video ID"}, status=400)
+    if start is None or end is None:
+        return web.json_response({"error": "Required params: start, end"}, status=400)
 
     try:
         start_f, end_f = float(start), float(end)
@@ -123,6 +121,20 @@ async def handle_stream(request: web.Request) -> web.Response:
         return web.json_response({"error": "start and end must be numbers"}, status=400)
     if end_f <= start_f:
         return web.json_response({"error": "end must be greater than start"}, status=400)
+
+    # Telegram link preview bot — return HTML with OG tags
+    ua = request.headers.get("User-Agent", "")
+    if "TelegramBot" in ua:
+        thumb = f"https://img.youtube.com/vi/{v}/hqdefault.jpg"
+        clip_url = f"{SERVICE_URL}/{v}?start={start}&end={end}"
+        html = (
+            f'<meta property="og:type" content="video.other">'
+            f'<meta property="og:image" content="{thumb}">'
+            f'<meta property="og:video" content="{clip_url}">'
+            f'<meta property="og:video:type" content="application/vnd.apple.mpegurl">'
+            f'<meta property="og:title" content="YouTube Clip">'
+        )
+        return web.Response(text=html, content_type="text/html")
 
     try:
         tmpdir = await _generate_hls(v, start_f, end_f)
@@ -135,7 +147,7 @@ async def handle_stream(request: web.Request) -> web.Response:
     # Rewrite local filenames to absolute URLs
     m3u8 = re.sub(
         r"seg(\d+)\.ts",
-        lambda m: f"{SERVICE_URL}/ts?v={v}&start={start_f}&end={end_f}&seg={m.group(1)}",
+        lambda m: f"{SERVICE_URL}/ts/{v}?start={start_f}&end={end_f}&seg={m.group(1)}",
         m3u8,
     )
 
@@ -143,13 +155,13 @@ async def handle_stream(request: web.Request) -> web.Response:
 
 
 async def handle_ts(request: web.Request) -> web.Response:
-    v = request.query.get("v")
+    v = request.match_info["v"]
     start = request.query.get("start")
     end = request.query.get("end")
     seg = request.query.get("seg")
 
-    if not v or start is None or end is None or seg is None:
-        return web.json_response({"error": "Required params: v, start, end, seg"}, status=400)
+    if start is None or end is None or seg is None:
+        return web.json_response({"error": "Required params: start, end, seg"}, status=400)
 
     key = (v, float(start), float(end))
     cached = _hls_cache.get(key)
@@ -224,7 +236,7 @@ async def process_end(message: Message, state: FSMContext):
 
     await state.clear()
 
-    clip_url = f"{SERVICE_URL}/stream?v={data['v']}&start={start}&end={end}"
+    clip_url = f"{SERVICE_URL}/{data['v']}?start={start}&end={end}"
     share_url = f"https://t.me/share/url?url={quote(clip_url)}"
 
     kb = InlineKeyboardMarkup(
@@ -251,8 +263,8 @@ async def process_url(message: Message, state: FSMContext):
 
 async def main():
     app = web.Application()
-    app.router.add_get("/stream", handle_stream)
-    app.router.add_get("/ts", handle_ts)
+    app.router.add_get("/{v:[a-zA-Z0-9_-]{11}}", handle_stream)
+    app.router.add_get("/ts/{v:[a-zA-Z0-9_-]{11}}", handle_ts)
 
     runner = web.AppRunner(app)
     await runner.setup()
