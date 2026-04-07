@@ -126,11 +126,13 @@ async def handle_stream(request: web.Request) -> web.Response:
     # Telegram link preview bot — return HTML with OG tags
     ua = request.headers.get("User-Agent", "")
     if "TelegramBot" in ua:
-        thumb = f"https://img.youtube.com/vi/{v}/hqdefault.jpg"
+        thumb = f"https://img.youtube.com/vi/{v}/maxresdefault.jpg"
         title = _title_cache.get((v, start_f, end_f), "YouTube Clip")
         html = (
             f'<meta property="og:type" content="video.other">'
             f'<meta property="og:image" content="{thumb}">'
+            f'<meta property="og:image:width" content="1280">'
+            f'<meta property="og:image:height" content="720">'
             f'<meta property="og:title" content="{title}">'
         )
         return web.Response(text=html, content_type="text/html")
