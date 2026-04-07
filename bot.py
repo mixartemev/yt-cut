@@ -21,7 +21,7 @@ load_dotenv()
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, LinkPreviewOptions
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -259,7 +259,12 @@ async def process_title(message: Message, state: FSMContext):
             [InlineKeyboardButton(text="Поделиться с контактом", url=share_url)],
         ]
     )
-    await message.answer("Отрывок готов! Нажмите кнопку, чтобы поделиться:", reply_markup=kb)
+    await message.answer(
+        f"[{title}]({clip_url})",
+        parse_mode="Markdown",
+        link_preview_options=LinkPreviewOptions(prefer_large_media=True),
+        reply_markup=kb,
+    )
 
 
 @dp.message()
