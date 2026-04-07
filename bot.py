@@ -52,7 +52,7 @@ async def _resolve(video_id: str) -> str:
         return cached[0]
 
     proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "-f", "best[ext=mp4]/best", "-g",
+        "yt-dlp", "-f", "best[height<=720][ext=mp4]/best[ext=mp4]/best", "-g",
         f"https://www.youtube.com/watch?v={video_id}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
