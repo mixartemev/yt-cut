@@ -73,6 +73,7 @@ def _cleanup_hls():
 
 
 async def _generate_hls(video_id: str, start: float, end: float) -> str:
+    """end=0 means no right trim."""
     key = (video_id, start, end)
     _cleanup_hls()
 
@@ -83,11 +84,14 @@ async def _generate_hls(video_id: str, start: float, end: float) -> str:
     stream_url = await _resolve(video_id)
     tmpdir = tempfile.mkdtemp(prefix="hls_")
 
-    proc = await asyncio.create_subprocess_exec(
+    cmd = [
         "ffmpeg",
         "-ss", str(start),
         "-i", stream_url,
-        "-t", str(end - start),
+    ]
+    if end:
+        cmd += ["-t", str(end - start)]
+    cmd += [
         "-c", "copy",
         "-f", "hls",
         "-hls_time", "4",
@@ -95,9 +99,12 @@ async def _generate_hls(video_id: str, start: float, end: float) -> str:
         "-hls_segment_filename", os.path.join(tmpdir, "seg%d.ts"),
         "-loglevel", "error",
         os.path.join(tmpdir, "stream.m3u8"),
-        stderr=asyncio.subprocess.PIPE,
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
 
     if proc.returncode != 0:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -109,30 +116,21 @@ async def _generate_hls(video_id: str, start: float, end: float) -> str:
 
 async def handle_stream(request: web.Request) -> web.Response:
     v = request.match_info["v"]
-    start = request.query.get("start")
-    end = request.query.get("end")
+    start_f = float(request.match_info["start"])
+    end_f = float(request.match_info.get("end", 0))
 
-    if start is None or end is None:
-        return web.json_response({"error": "Required params: start, end"}, status=400)
-
-    try:
-        start_f, end_f = float(start), float(end)
-    except ValueError:
-        return web.json_response({"error": "start and end must be numbers"}, status=400)
-    if end_f <= start_f:
+    if end_f and end_f <= start_f:
         return web.json_response({"error": "end must be greater than start"}, status=400)
 
     # Telegram link preview bot — return HTML with OG tags
     ua = request.headers.get("User-Agent", "")
     if "TelegramBot" in ua:
         thumb = f"https://img.youtube.com/vi/{v}/hqdefault.jpg"
-        clip_url = f"{SERVICE_URL}/{v}?start={start}&end={end}"
+        title = request.query.get("title", "YouTube Clip")
         html = (
             f'<meta property="og:type" content="video.other">'
             f'<meta property="og:image" content="{thumb}">'
-            f'<meta property="og:video" content="{clip_url}">'
-            f'<meta property="og:video:type" content="application/vnd.apple.mpegurl">'
-            f'<meta property="og:title" content="YouTube Clip">'
+            f'<meta property="og:title" content="{title}">'
         )
         return web.Response(text=html, content_type="text/html")
 
@@ -145,9 +143,10 @@ async def handle_stream(request: web.Request) -> web.Response:
         m3u8 = f.read()
 
     # Rewrite local filenames to absolute URLs
+    ts_base = f"{SERVICE_URL}/ts/{v}/{start_f}/{end_f}" if end_f else f"{SERVICE_URL}/ts/{v}/{start_f}"
     m3u8 = re.sub(
         r"seg(\d+)\.ts",
-        lambda m: f"{SERVICE_URL}/ts/{v}?start={start_f}&end={end_f}&seg={m.group(1)}",
+        lambda m: f"{ts_base}?seg={m.group(1)}",
         m3u8,
     )
 
@@ -156,14 +155,14 @@ async def handle_stream(request: web.Request) -> web.Response:
 
 async def handle_ts(request: web.Request) -> web.Response:
     v = request.match_info["v"]
-    start = request.query.get("start")
-    end = request.query.get("end")
+    start_f = float(request.match_info["start"])
+    end_f = float(request.match_info.get("end", 0))
     seg = request.query.get("seg")
 
-    if start is None or end is None or seg is None:
-        return web.json_response({"error": "Required params: start, end, seg"}, status=400)
+    if seg is None:
+        return web.json_response({"error": "Required param: seg"}, status=400)
 
-    key = (v, float(start), float(end))
+    key = (v, start_f, end_f)
     cached = _hls_cache.get(key)
     if not cached:
         return web.json_response({"error": "Session expired, reload playlist"}, status=404)
@@ -180,6 +179,7 @@ async def handle_ts(request: web.Request) -> web.Response:
 class ClipForm(StatesGroup):
     start = State()
     end = State()
+    title = State()
 
 
 def parse_time(text: str) -> float:
@@ -224,19 +224,30 @@ async def process_end(message: Message, state: FSMContext):
     try:
         end = parse_time(message.text)
     except ValueError:
-        await message.answer("Некорректный формат. Введите время как мин:сек (например 10:30):")
+        await message.answer("Некорректный формат. Введите время как мин:сек (например 10:30 или 0:00):")
         return
 
     data = await state.get_data()
     start = data["start"]
 
-    if end <= start:
+    if end and end <= start:
         await message.answer("Время конца должно быть больше времени начала. Попробуйте ещё раз:")
         return
 
+    await state.update_data(end=end)
+    await state.set_state(ClipForm.title)
+    await message.answer("Введите название ролика:")
+
+
+@dp.message(ClipForm.title)
+async def process_title(message: Message, state: FSMContext):
+    title = message.text.strip()
+    data = await state.get_data()
     await state.clear()
 
-    clip_url = f"{SERVICE_URL}/{data['v']}?start={start}&end={end}"
+    start, end = data["start"], data["end"]
+    base = f"{SERVICE_URL}/{data['v']}/{start}/{end}" if end else f"{SERVICE_URL}/{data['v']}/{start}"
+    clip_url = f"{base}?title={quote(title)}"
     share_url = f"https://t.me/share/url?url={quote(clip_url)}"
 
     kb = InlineKeyboardMarkup(
@@ -263,8 +274,11 @@ async def process_url(message: Message, state: FSMContext):
 
 async def main():
     app = web.Application()
-    app.router.add_get("/{v:[a-zA-Z0-9_-]{11}}", handle_stream)
-    app.router.add_get("/ts/{v:[a-zA-Z0-9_-]{11}}", handle_ts)
+    vid = r"{v:[a-zA-Z0-9_-]{11}}"
+    app.router.add_get(f"/{vid}/{{start}}", handle_stream)
+    app.router.add_get(f"/{vid}/{{start}}/{{end}}", handle_stream)
+    app.router.add_get(f"/ts/{vid}/{{start}}", handle_ts)
+    app.router.add_get(f"/ts/{vid}/{{start}}/{{end}}", handle_ts)
 
     runner = web.AppRunner(app)
     await runner.setup()
