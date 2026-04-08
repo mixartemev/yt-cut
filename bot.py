@@ -37,22 +37,28 @@ dp = Dispatcher()
 VIDEO_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)([a-zA-Z0-9_-]{11})")
 
 _CACHE_TTL = 1800
-_url_cache: dict[str, tuple[str, float]] = {}
+_url_cache: dict[tuple[str, str], tuple[str, float]] = {}
 _hls_cache: dict[tuple, tuple[str, float]] = {}
 _title_cache: dict[tuple, str] = {}
+
+_FORMATS = {
+    "video": "best[height<=720][ext=mp4]/best[ext=mp4]/best",
+    "audio": "bestaudio[ext=m4a]/bestaudio",
+}
 
 
 # ── Clip server ──────────────────────────────────────────────────────────────
 
 
-async def _resolve(video_id: str) -> str:
+async def _resolve(video_id: str, kind: str = "video") -> str:
     now = time.time()
-    cached = _url_cache.get(video_id)
+    key = (video_id, kind)
+    cached = _url_cache.get(key)
     if cached and now - cached[1] < _CACHE_TTL:
         return cached[0]
 
     proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "-f", "best[height<=720][ext=mp4]/best[ext=mp4]/best", "-g",
+        "yt-dlp", "-f", _FORMATS[kind], "-g",
         f"https://www.youtube.com/watch?v={video_id}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -62,7 +68,7 @@ async def _resolve(video_id: str) -> str:
         raise RuntimeError(stderr.decode().strip())
 
     url = stdout.decode().strip().splitlines()[0]
-    _url_cache[video_id] = (url, now)
+    _url_cache[key] = (url, now)
     return url
 
 
@@ -73,16 +79,16 @@ def _cleanup_hls():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-async def _generate_hls(video_id: str, start: float, end: float) -> str:
+async def _generate_hls(video_id: str, start: float, end: float, kind: str = "video") -> str:
     """end=0 means no right trim."""
-    key = (video_id, start, end)
+    key = (video_id, start, end, kind)
     _cleanup_hls()
 
     cached = _hls_cache.get(key)
     if cached:
         return cached[0]
 
-    stream_url = await _resolve(video_id)
+    stream_url = await _resolve(video_id, kind)
     tmpdir = tempfile.mkdtemp(prefix="hls_")
 
     cmd = [
@@ -92,6 +98,8 @@ async def _generate_hls(video_id: str, start: float, end: float) -> str:
     ]
     if end:
         cmd += ["-t", str(end - start)]
+    if kind == "audio":
+        cmd += ["-vn"]
     cmd += [
         "-c", "copy",
         "-f", "hls",
@@ -116,6 +124,7 @@ async def _generate_hls(video_id: str, start: float, end: float) -> str:
 
 
 async def handle_stream(request: web.Request) -> web.Response:
+    kind = "audio" if request.path.startswith("/audio/") else "video"
     v = request.match_info["v"]
     start_f = float(request.match_info["start"])
     end_f = float(request.match_info.get("end", 0))
@@ -123,9 +132,9 @@ async def handle_stream(request: web.Request) -> web.Response:
     if end_f and end_f <= start_f:
         return web.json_response({"error": "end must be greater than start"}, status=400)
 
-    # Telegram link preview bot — return HTML with OG tags
+    # Telegram link preview bot — return HTML with OG tags (video only)
     ua = request.headers.get("User-Agent", "")
-    if "TelegramBot" in ua:
+    if kind == "video" and "TelegramBot" in ua:
         thumb = f"https://img.youtube.com/vi/{v}/maxresdefault.jpg"
         title = _title_cache.get((v, start_f, end_f), "YouTube Clip")
         self_url = str(request.url)
@@ -143,7 +152,7 @@ async def handle_stream(request: web.Request) -> web.Response:
         return web.Response(text=html, content_type="text/html")
 
     try:
-        tmpdir = await _generate_hls(v, start_f, end_f)
+        tmpdir = await _generate_hls(v, start_f, end_f, kind)
     except RuntimeError as e:
         return web.json_response({"error": str(e)}, status=502)
 
@@ -151,7 +160,8 @@ async def handle_stream(request: web.Request) -> web.Response:
         m3u8 = f.read()
 
     # Rewrite local filenames to absolute URLs
-    ts_base = f"{SERVICE_URL}/ts/{v}/{start_f}/{end_f}" if end_f else f"{SERVICE_URL}/ts/{v}/{start_f}"
+    ts_prefix = "/ts/audio" if kind == "audio" else "/ts"
+    ts_base = f"{SERVICE_URL}{ts_prefix}/{v}/{start_f}/{end_f}" if end_f else f"{SERVICE_URL}{ts_prefix}/{v}/{start_f}"
     m3u8 = re.sub(
         r"seg(\d+)\.ts",
         lambda m: f"{ts_base}?seg={m.group(1)}",
@@ -162,6 +172,7 @@ async def handle_stream(request: web.Request) -> web.Response:
 
 
 async def handle_ts(request: web.Request) -> web.Response:
+    kind = "audio" if request.path.startswith("/ts/audio/") else "video"
     v = request.match_info["v"]
     start_f = float(request.match_info["start"])
     end_f = float(request.match_info.get("end", 0))
@@ -170,7 +181,7 @@ async def handle_ts(request: web.Request) -> web.Response:
     if seg is None:
         return web.json_response({"error": "Required param: seg"}, status=400)
 
-    key = (v, start_f, end_f)
+    key = (v, start_f, end_f, kind)
     cached = _hls_cache.get(key)
     if not cached:
         return web.json_response({"error": "Session expired, reload playlist"}, status=404)
@@ -299,8 +310,12 @@ async def main():
     vid = r"{v:[a-zA-Z0-9_-]{11}}"
     app.router.add_get(f"/{vid}/{{start}}", handle_stream)
     app.router.add_get(f"/{vid}/{{start}}/{{end}}", handle_stream)
+    app.router.add_get(f"/audio/{vid}/{{start}}", handle_stream)
+    app.router.add_get(f"/audio/{vid}/{{start}}/{{end}}", handle_stream)
     app.router.add_get(f"/ts/{vid}/{{start}}", handle_ts)
     app.router.add_get(f"/ts/{vid}/{{start}}/{{end}}", handle_ts)
+    app.router.add_get(f"/ts/audio/{vid}/{{start}}", handle_ts)
+    app.router.add_get(f"/ts/audio/{vid}/{{start}}/{{end}}", handle_ts)
 
     runner = web.AppRunner(app)
     await runner.setup()
