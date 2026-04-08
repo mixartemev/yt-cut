@@ -13,7 +13,11 @@ import asyncio
 import time
 import tempfile
 import shutil
-from urllib.parse import quote
+import hmac
+import hashlib
+import json
+import secrets
+from urllib.parse import quote, parse_qsl
 
 from dotenv import load_dotenv
 
@@ -21,7 +25,17 @@ load_dotenv()
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, LinkPreviewOptions
+from aiogram.types import (
+    Message,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+    LinkPreviewOptions,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    MenuButtonWebApp,
+    WebAppInfo,
+)
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -40,11 +54,14 @@ _CACHE_TTL = 1800
 _url_cache: dict[tuple[str, str], tuple[str, float]] = {}
 _hls_cache: dict[tuple, tuple[str, float]] = {}
 _title_cache: dict[tuple, str] = {}
+_meta_cache: dict[str, tuple[dict, float]] = {}
 
 _FORMATS = {
     "video": "best[height<=720][ext=mp4]/best[ext=mp4]/best",
     "audio": "bestaudio[ext=m4a]/bestaudio",
 }
+
+MINIAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp", "dist")
 
 
 # ── Clip server ──────────────────────────────────────────────────────────────
@@ -193,6 +210,119 @@ async def handle_ts(request: web.Request) -> web.Response:
     return web.FileResponse(ts_path, headers={"Content-Type": "video/mp2t"})
 
 
+# ── Mini App API ─────────────────────────────────────────────────────────────
+
+
+async def _fetch_meta(video_id: str) -> dict:
+    now = time.time()
+    cached = _meta_cache.get(video_id)
+    if cached and now - cached[1] < _CACHE_TTL:
+        return cached[0]
+
+    proc = await asyncio.create_subprocess_exec(
+        "yt-dlp", "--print", "%(title)s\n%(duration)s",
+        f"https://www.youtube.com/watch?v={video_id}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    if proc.returncode != 0:
+        raise RuntimeError(stderr.decode().strip())
+
+    title, duration = stdout.decode().strip().split("\n", 1)
+    meta = {
+        "video_id": video_id,
+        "title": title,
+        "duration": int(float(duration)),
+        "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+    }
+    _meta_cache[video_id] = (meta, now)
+    return meta
+
+
+def _verify_init_data(init_data: str) -> dict | None:
+    """Validate Telegram WebApp initData HMAC. Returns user dict on success."""
+    try:
+        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+        recv_hash = parsed.pop("hash", None)
+        if not recv_hash:
+            return None
+        data_check = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, recv_hash):
+            return None
+        return json.loads(parsed.get("user", "{}"))
+    except Exception:
+        return None
+
+
+async def handle_api_info(request: web.Request) -> web.Response:
+    body = await request.json()
+    url = (body.get("url") or "").strip()
+    m = VIDEO_ID_RE.search(url)
+    if not m:
+        return web.json_response({"error": "Invalid YouTube URL"}, status=400)
+    try:
+        meta = await _fetch_meta(m.group(1))
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=502)
+    return web.json_response(meta)
+
+
+async def handle_api_share(request: web.Request) -> web.Response:
+    body = await request.json()
+    user = _verify_init_data(body.get("init_data", ""))
+    if not user or "id" not in user:
+        return web.json_response({"error": "Auth failed"}, status=401)
+
+    video_id = body["video_id"]
+    start = float(body.get("start", 0))
+    end = float(body.get("end", 0))
+    title = (body.get("title") or "").strip() or "YouTube Clip"
+    kind = "audio" if body.get("kind") == "audio" else "video"
+
+    if end and end <= start:
+        return web.json_response({"error": "end must be greater than start"}, status=400)
+
+    prefix = "/audio" if kind == "audio" else ""
+    url_path = f"{prefix}/{video_id}/{start}/{end}" if end else f"{prefix}/{video_id}/{start}"
+    clip_url = f"{SERVICE_URL}{url_path}"
+    _title_cache[(video_id, start, end)] = title
+
+    inline_result = InlineQueryResultArticle(
+        id=secrets.token_hex(8),
+        title=title,
+        thumbnail_url=f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+        input_message_content=InputTextMessageContent(
+            message_text=f"[{title}]({clip_url})",
+            parse_mode="Markdown",
+            link_preview_options=LinkPreviewOptions(url=clip_url, prefer_large_media=True),
+        ),
+    )
+
+    try:
+        prepared = await bot.save_prepared_inline_message(
+            user_id=user["id"],
+            result=inline_result,
+            allow_user_chats=True,
+            allow_group_chats=True,
+            allow_channel_chats=True,
+        )
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=502)
+
+    return web.json_response({"prepared_message_id": prepared.id})
+
+
+async def handle_miniapp_index(request: web.Request) -> web.StreamResponse:
+    return web.FileResponse(os.path.join(MINIAPP_DIR, "index.html"))
+
+
+async def handle_miniapp_redirect(request: web.Request) -> web.StreamResponse:
+    raise web.HTTPFound("/miniapp/")
+
+
 # ── Telegram bot ─────────────────────────────────────────────────────────────
 
 class ClipForm(StatesGroup):
@@ -317,10 +447,28 @@ async def main():
     app.router.add_get(f"/ts/audio/{vid}/{{start}}", handle_ts)
     app.router.add_get(f"/ts/audio/{vid}/{{start}}/{{end}}", handle_ts)
 
+    app.router.add_post("/api/info", handle_api_info)
+    app.router.add_post("/api/share", handle_api_share)
+
+    if os.path.isdir(MINIAPP_DIR):
+        app.router.add_get("/miniapp", handle_miniapp_redirect)
+        app.router.add_get("/miniapp/", handle_miniapp_index)
+        app.router.add_static("/miniapp/", MINIAPP_DIR)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+
+    try:
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(
+                text="Редактор",
+                web_app=WebAppInfo(url=f"{SERVICE_URL}/miniapp/"),
+            )
+        )
+    except Exception:
+        pass
 
     try:
         await dp.start_polling(bot)
