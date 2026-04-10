@@ -44,8 +44,9 @@ from aiogram.fsm.state import State, StatesGroup
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SERVICE_URL = os.environ.get("SERVICE_URL", "http://localhost:8080")
 PORT = int(os.environ.get("PORT", "8080"))
+PRX = os.environ.get("PRX")
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, proxy=PRX)
 dp = Dispatcher()
 
 VIDEO_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)([a-zA-Z0-9_-]{11})")
@@ -60,8 +61,18 @@ _FORMATS = {
     "video": "best[height<=720][ext=mp4]/best[ext=mp4]/best",
     "audio": "bestaudio[ext=m4a]/bestaudio",
 }
+_KIND_PREFIX = {"video": "", "audio": "/audio"}
 
 MINIAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp", "dist")
+
+
+def _clip_path(v: str, start: int, end: int, kind: str) -> str:
+    base = f"{_KIND_PREFIX[kind]}/{v}/{start}"
+    return f"{base}/{end}" if end else base
+
+
+def _ts_path(v: str, start: int, end: int, kind: str) -> str:
+    return "/ts" + _clip_path(v, start, end, kind)
 
 
 # ── Clip server ──────────────────────────────────────────────────────────────
@@ -96,7 +107,7 @@ def _cleanup_hls():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-async def _generate_hls(video_id: str, start: float, end: float, kind: str = "video") -> str:
+async def _generate_hls(video_id: str, start: int, end: int, kind: str = "video") -> str:
     """end=0 means no right trim."""
     key = (video_id, start, end, kind)
     _cleanup_hls()
@@ -143,17 +154,17 @@ async def _generate_hls(video_id: str, start: float, end: float, kind: str = "vi
 async def handle_stream(request: web.Request) -> web.Response:
     kind = "audio" if request.path.startswith("/audio/") else "video"
     v = request.match_info["v"]
-    start_f = float(request.match_info["start"])
-    end_f = float(request.match_info.get("end", 0))
+    start = int(request.match_info["start"])
+    end = int(request.match_info.get("end") or 0)
 
-    if end_f and end_f <= start_f:
+    if end and end <= start:
         return web.json_response({"error": "end must be greater than start"}, status=400)
 
     # Telegram link preview bot — return HTML with OG tags (video only)
     ua = request.headers.get("User-Agent", "")
     if kind == "video" and "TelegramBot" in ua:
         thumb = f"https://img.youtube.com/vi/{v}/maxresdefault.jpg"
-        title = _title_cache.get((v, start_f, end_f), "YouTube Clip")
+        title = _title_cache.get((v, start, end), "YouTube Clip")
         self_url = str(request.url)
         html = (
             f'<meta property="og:type" content="video.other">'
@@ -169,16 +180,14 @@ async def handle_stream(request: web.Request) -> web.Response:
         return web.Response(text=html, content_type="text/html")
 
     try:
-        tmpdir = await _generate_hls(v, start_f, end_f, kind)
+        tmpdir = await _generate_hls(v, start, end, kind)
     except RuntimeError as e:
         return web.json_response({"error": str(e)}, status=502)
 
     with open(os.path.join(tmpdir, "stream.m3u8")) as f:
         m3u8 = f.read()
 
-    # Rewrite local filenames to absolute URLs
-    ts_prefix = "/ts/audio" if kind == "audio" else "/ts"
-    ts_base = f"{SERVICE_URL}{ts_prefix}/{v}/{start_f}/{end_f}" if end_f else f"{SERVICE_URL}{ts_prefix}/{v}/{start_f}"
+    ts_base = SERVICE_URL + _ts_path(v, start, end, kind)
     m3u8 = re.sub(
         r"seg(\d+)\.ts",
         lambda m: f"{ts_base}?seg={m.group(1)}",
@@ -191,15 +200,14 @@ async def handle_stream(request: web.Request) -> web.Response:
 async def handle_ts(request: web.Request) -> web.Response:
     kind = "audio" if request.path.startswith("/ts/audio/") else "video"
     v = request.match_info["v"]
-    start_f = float(request.match_info["start"])
-    end_f = float(request.match_info.get("end", 0))
+    start = int(request.match_info["start"])
+    end = int(request.match_info.get("end") or 0)
     seg = request.query.get("seg")
 
     if seg is None:
         return web.json_response({"error": "Required param: seg"}, status=400)
 
-    key = (v, start_f, end_f, kind)
-    cached = _hls_cache.get(key)
+    cached = _hls_cache.get((v, start, end, kind))
     if not cached:
         return web.json_response({"error": "Session expired, reload playlist"}, status=404)
 
@@ -277,17 +285,15 @@ async def handle_api_share(request: web.Request) -> web.Response:
         return web.json_response({"error": "Auth failed"}, status=401)
 
     video_id = body["video_id"]
-    start = float(body.get("start", 0))
-    end = float(body.get("end", 0))
+    start = int(body.get("start", 0))
+    end = int(body.get("end", 0))
     title = (body.get("title") or "").strip() or "YouTube Clip"
     kind = "audio" if body.get("kind") == "audio" else "video"
 
     if end and end <= start:
         return web.json_response({"error": "end must be greater than start"}, status=400)
 
-    prefix = "/audio" if kind == "audio" else ""
-    url_path = f"{prefix}/{video_id}/{start}/{end}" if end else f"{prefix}/{video_id}/{start}"
-    clip_url = f"{SERVICE_URL}{url_path}"
+    clip_url = SERVICE_URL + _clip_path(video_id, start, end, kind)
     _title_cache[(video_id, start, end)] = title
 
     inline_result = InlineQueryResultArticle(
@@ -331,7 +337,7 @@ class ClipForm(StatesGroup):
     title = State()
 
 
-def parse_time(text: str) -> float:
+def parse_time(text: str) -> int:
     """Parse 'min:sec' (e.g. 8:54) or '0' to seconds."""
     text = text.strip()
     if text == "0":
@@ -398,8 +404,8 @@ async def process_title(message: Message, state: FSMContext):
     await state.clear()
 
     start, end, v = data["start"], data["end"], data["v"]
-    _title_cache[(v, float(start), float(end))] = title
-    clip_url = f"{SERVICE_URL}/{v}/{start}/{end}" if end else f"{SERVICE_URL}/{v}/{start}"
+    _title_cache[(v, start, end)] = title
+    clip_url = SERVICE_URL + _clip_path(v, start, end, "video")
     share_url = f"https://t.me/share/url?url={quote(clip_url)}"
 
     kb = InlineKeyboardMarkup(
@@ -438,14 +444,15 @@ async def main():
     app = web.Application()
     app.router.add_get("/", handle_root)
     vid = r"{v:[a-zA-Z0-9_-]{11}}"
-    app.router.add_get(f"/{vid}/{{start}}", handle_stream)
-    app.router.add_get(f"/{vid}/{{start}}/{{end}}", handle_stream)
-    app.router.add_get(f"/audio/{vid}/{{start}}", handle_stream)
-    app.router.add_get(f"/audio/{vid}/{{start}}/{{end}}", handle_stream)
-    app.router.add_get(f"/ts/{vid}/{{start}}", handle_ts)
-    app.router.add_get(f"/ts/{vid}/{{start}}/{{end}}", handle_ts)
-    app.router.add_get(f"/ts/audio/{vid}/{{start}}", handle_ts)
-    app.router.add_get(f"/ts/audio/{vid}/{{start}}/{{end}}", handle_ts)
+    for prefix, handler in (
+        ("", handle_stream),
+        ("/audio", handle_stream),
+        ("/ts", handle_ts),
+        ("/ts/audio", handle_ts),
+    ):
+        base = f"{prefix}/{vid}/{{start:\\d+}}"
+        app.router.add_get(base, handler)
+        app.router.add_get(f"{base}/{{end:\\d+}}", handler)
 
     app.router.add_post("/api/info", handle_api_info)
     app.router.add_post("/api/share", handle_api_share)
