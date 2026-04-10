@@ -15,7 +15,7 @@ Dockerfile двухстадийный: Node собирает Mini App, Python-с
 
 ```bash
 docker build -t yt-cut .
-docker run --env-file .env -p 8080:8080 -v ./bot.py:/app/bot.py yt-cut
+docker run --env-file .env -p 8080:8080 -v ./bot.py:/app/bot.py -v ./cookies.txt:/app/cookies.txt yt-cut
 ```
 
 ## Локальная разработка
