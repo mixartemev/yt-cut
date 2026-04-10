@@ -12,6 +12,7 @@ import {
 } from '@telegram-apps/telegram-ui'
 
 const tg = window.Telegram?.WebApp
+const inTelegram = !!tg?.initData
 
 interface Meta {
   video_id: string
@@ -49,6 +50,7 @@ export default function App() {
   const [range, setRange] = useState<[number, number]>([0, 0])
   const [audio, setAudio] = useState(false)
   const [customTitle, setCustomTitle] = useState('')
+  const [toast, setToast] = useState<string | null>(null)
 
   useEffect(() => {
     tg?.ready()
@@ -91,19 +93,26 @@ export default function App() {
   }, [url])
 
   const handlePaste = useCallback(async () => {
+    try {
+      if (navigator.clipboard?.readText) {
+        const text = await navigator.clipboard.readText()
+        if (text) {
+          setUrl(text)
+          return
+        }
+      }
+    } catch {
+      // permission denied or not in secure context — fall through
+    }
     const anyTg = tg as any
-    if (anyTg?.readTextFromClipboard) {
+    if (inTelegram && anyTg?.readTextFromClipboard) {
       anyTg.readTextFromClipboard((text: string | null) => {
         if (text) setUrl(text)
       })
       return
     }
-    try {
-      const text = await navigator.clipboard.readText()
-      if (text) setUrl(text)
-    } catch {
-      // clipboard unavailable
-    }
+    setToast('Вставьте ссылку вручную')
+    setTimeout(() => setToast(null), 2000)
   }, [])
 
   const onShare = useCallback(async () => {
@@ -137,9 +146,9 @@ export default function App() {
     }
   }, [meta, range, audio, customTitle])
 
-  // MainButton wiring
+  // MainButton wiring (Telegram only)
   useEffect(() => {
-    if (!tg?.MainButton) return
+    if (!inTelegram || !tg?.MainButton) return
     tg.MainButton.setText('Поделиться')
     if (meta) {
       tg.MainButton.show()
@@ -149,6 +158,31 @@ export default function App() {
       tg.MainButton.hide()
     }
   }, [meta, onShare])
+
+  const onBrowserShare = useCallback(async () => {
+    if (!meta) return
+    const start = Math.round(range[0])
+    const end = Math.round(range[1])
+    const endPart = end >= meta.duration ? '' : `/${end}`
+    const prefix = audio ? '/audio' : ''
+    const clipUrl = `${window.location.origin}${prefix}/${meta.video_id}/${start}${endPart}`
+    const title = customTitle.trim() || meta.title
+    try {
+      if (navigator.share) {
+        await navigator.share({ title, url: clipUrl })
+        return
+      }
+    } catch {
+      return // user cancelled
+    }
+    try {
+      await navigator.clipboard.writeText(clipUrl)
+      setToast('Ссылка скопирована')
+    } catch {
+      setToast(clipUrl)
+    }
+    setTimeout(() => setToast(null), 2500)
+  }, [meta, range, audio, customTitle])
 
   return (
     <AppRoot appearance={tg?.colorScheme}>
@@ -189,7 +223,7 @@ export default function App() {
         )}
 
         {meta && !loading && (
-          <Section>
+          <Section style={inTelegram ? undefined : { paddingBottom: 96 }}>
             <Cell before={<Image src={meta.thumbnail} size={40} />}>
               {meta.title}
             </Cell>
@@ -231,6 +265,60 @@ export default function App() {
           </Section>
         )}
       </List>
+
+      {!inTelegram && meta && (
+        <div
+          style={{
+            position: 'fixed',
+            left: 0,
+            right: 0,
+            bottom: 0,
+            padding: '12px 16px calc(12px + env(safe-area-inset-bottom))',
+            background: 'var(--tgui--bg_color)',
+            borderTop: '1px solid var(--tgui--divider)',
+            zIndex: 10,
+          }}
+        >
+          <button
+            type="button"
+            onClick={onBrowserShare}
+            style={{
+              width: '100%',
+              padding: '14px 16px',
+              border: 'none',
+              borderRadius: 12,
+              background: 'var(--tgui--button_color, #3390ec)',
+              color: 'var(--tgui--button_text_color, #ffffff)',
+              fontSize: 16,
+              fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            Поделиться
+          </button>
+        </div>
+      )}
+
+      {toast && (
+        <div
+          style={{
+            position: 'fixed',
+            left: '50%',
+            bottom: inTelegram ? 24 : 96,
+            transform: 'translateX(-50%)',
+            padding: '10px 16px',
+            background: 'rgba(0,0,0,0.8)',
+            color: '#fff',
+            borderRadius: 12,
+            fontSize: 14,
+            maxWidth: '90%',
+            textAlign: 'center',
+            zIndex: 20,
+          }}
+        >
+          {toast}
+        </div>
+      )}
     </AppRoot>
   )
 }

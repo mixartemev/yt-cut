@@ -46,6 +46,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 SERVICE_URL = os.environ.get("SERVICE_URL", "http://localhost:8080")
 PORT = int(os.environ.get("PORT", "8080"))
 PRX = os.environ.get("PRX")
+YT_CLIENT = os.environ.get("YT_CLIENT", "tv_simply,web_safari,mweb")
 
 session = PRX and AiohttpSession(proxy=PRX)
 bot = Bot(token=BOT_TOKEN, session=session)
@@ -88,7 +89,9 @@ async def _resolve(video_id: str, kind: str = "video") -> str:
         return cached[0]
 
     proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "-f", _FORMATS[kind], "-g", "--proxy", PRX,
+        "yt-dlp", "-f", _FORMATS[kind], "-g",
+        "--proxy", PRX,
+        "--extractor-args", f"youtube:player_client={YT_CLIENT}",
         f"https://www.youtube.com/watch?v={video_id}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -231,6 +234,8 @@ async def _fetch_meta(video_id: str) -> dict:
 
     proc = await asyncio.create_subprocess_exec(
         "yt-dlp", "--print", "%(title)s\n%(duration)s",
+        "--proxy", PRX,
+        "--extractor-args", f"youtube:player_client={YT_CLIENT}",
         f"https://www.youtube.com/watch?v={video_id}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
