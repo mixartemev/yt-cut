@@ -88,7 +88,7 @@ async def _resolve(video_id: str, kind: str = "video") -> str:
         return cached[0]
 
     proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "-f", _FORMATS[kind], "-g",
+        "yt-dlp", "-f", _FORMATS[kind], "-g", "--proxy", PRX,
         f"https://www.youtube.com/watch?v={video_id}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -296,14 +296,22 @@ async def handle_api_share(request: web.Request) -> web.Response:
         return web.json_response({"error": "end must be greater than start"}, status=400)
 
     clip_url = SERVICE_URL + _clip_path(video_id, start, end, kind)
+    source_url = f"https://www.youtube.com/watch?v={video_id}"
     _title_cache[(video_id, start, end)] = title
+
+    try:
+        original_title = (await _fetch_meta(video_id))["title"]
+    except Exception:
+        original_title = title
+
+    message_text = f"[{title}]({clip_url})\n\nоригинал: [{original_title}]({source_url})"
 
     inline_result = InlineQueryResultArticle(
         id=secrets.token_hex(8),
         title=title,
         thumbnail_url=f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
         input_message_content=InputTextMessageContent(
-            message_text=f"[{title}]({clip_url})",
+            message_text=message_text,
             parse_mode="Markdown",
             link_preview_options=LinkPreviewOptions(url=clip_url, prefer_large_media=True),
         ),

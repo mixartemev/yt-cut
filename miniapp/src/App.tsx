@@ -152,8 +152,8 @@ export default function App() {
 
   return (
     <AppRoot appearance={tg?.colorScheme}>
-      <List>
-        <Section header="YouTube ссылка">
+      <List style={{ padding: 0 }}>
+        <Section>
           <Input
             placeholder="https://youtube.com/watch?v=..."
             value={url}
@@ -181,64 +181,54 @@ export default function App() {
         </Section>
 
         {loading && (
-          <Section>
-            <Cell before={<Spinner size="s" />}>Загрузка...</Cell>
-          </Section>
+          <Cell before={<Spinner size="s" />}>Загрузка...</Cell>
         )}
 
         {error && !loading && (
-          <Section>
-            <Cell multiline>{error}</Cell>
-          </Section>
+          <Cell multiline>{error}</Cell>
         )}
 
         {meta && !loading && (
-          <>
-            <Section header="Превью">
-              <Cell
-                before={<Image src={meta.thumbnail} size={48} />}
-                multiline
-                subtitle={`Длительность ${fmt(meta.duration)}`}
+          <Section>
+            <Cell before={<Image src={meta.thumbnail} size={40} />}>
+              {meta.title}
+            </Cell>
+            <div style={{ padding: '4px 20px 8px' }}>
+              <div
+                style={{
+                  fontSize: 13,
+                  color: 'var(--tgui--hint_color)',
+                  marginBottom: 4,
+                }}
               >
-                {meta.title}
-              </Cell>
-            </Section>
-
-            <Section header={`Обрезка: ${fmt(range[0])} — ${fmt(range[1])}`}>
-              <div style={{ padding: '16px 20px' }}>
-                <Slider
-                  multiple
-                  min={0}
-                  max={meta.duration}
-                  step={1}
-                  value={range}
-                  onChange={(v) => setRange([Math.round(v[0]), Math.round(v[1])])}
-                />
+                {`Обрезка: ${fmt(range[0])} — ${fmt(range[1])}`}
               </div>
-            </Section>
-
-            <Section header="Заголовок (необязательно)">
-              <Input
-                placeholder={meta.title}
-                value={customTitle}
-                onChange={(e) => setCustomTitle(e.target.value)}
+              <Slider
+                multiple
+                min={0}
+                max={meta.duration}
+                step={1}
+                value={range}
+                onChange={(v) => setRange([Math.round(v[0]), Math.round(v[1])])}
               />
-            </Section>
-
-            <Section header="Режим">
-              <Cell
-                Component="label"
-                after={
-                  <Switch
-                    checked={audio}
-                    onChange={(e) => setAudio(e.target.checked)}
-                  />
-                }
-              >
-                Только аудио
-              </Cell>
-            </Section>
-          </>
+            </div>
+            <Input
+              placeholder={`Заголовок (${meta.title})`}
+              value={customTitle}
+              onChange={(e) => setCustomTitle(e.target.value)}
+            />
+            <Cell
+              Component="label"
+              after={
+                <Switch
+                  checked={audio}
+                  onChange={(e) => setAudio(e.target.checked)}
+                />
+              }
+            >
+              Только аудио
+            </Cell>
+          </Section>
         )}
       </List>
     </AppRoot>
