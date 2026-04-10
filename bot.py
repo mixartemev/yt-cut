@@ -43,12 +43,22 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-SERVICE_URL = os.environ.get("SERVICE_URL", "http://localhost:8080")
+SERVICE_URL = os.environ.get("SERVICE_URL", "http://127.0.0.1:8080")
 PORT = int(os.environ.get("PORT", "8080"))
 PRX = os.environ.get("PRX")
-YT_CLIENT = os.environ.get("YT_CLIENT", "tv_simply,web_safari,mweb")
+TGPRX = os.environ.get("TGPRX")
+YT_CLIENT = os.environ.get("YT_CLIENT")
+YT_COOKIES = os.environ.get("YT_COOKIES")
 
-session = PRX and AiohttpSession(proxy=PRX)
+_YT_COMMON = []
+if PRX:
+    _YT_COMMON += ["--proxy", PRX]
+if YT_CLIENT:
+    _YT_COMMON += ["--extractor-args", f"youtube:player_client={YT_CLIENT}"]
+if YT_COOKIES:
+    _YT_COMMON += ["--cookies", YT_COOKIES]
+
+session = TGPRX and AiohttpSession(proxy=TGPRX)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
@@ -89,9 +99,7 @@ async def _resolve(video_id: str, kind: str = "video") -> str:
         return cached[0]
 
     proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "-f", _FORMATS[kind], "-g",
-        "--proxy", PRX,
-        "--extractor-args", f"youtube:player_client={YT_CLIENT}",
+        "yt-dlp", "-f", _FORMATS[kind], "-g", *_YT_COMMON,
         f"https://www.youtube.com/watch?v={video_id}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -225,7 +233,6 @@ async def handle_ts(request: web.Request) -> web.Response:
 
 # ── Mini App API ─────────────────────────────────────────────────────────────
 
-
 async def _fetch_meta(video_id: str) -> dict:
     now = time.time()
     cached = _meta_cache.get(video_id)
@@ -233,9 +240,7 @@ async def _fetch_meta(video_id: str) -> dict:
         return cached[0]
 
     proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "--print", "%(title)s\n%(duration)s",
-        "--proxy", PRX,
-        "--extractor-args", f"youtube:player_client={YT_CLIENT}",
+        "yt-dlp", "--print", "%(title)s\n%(duration)s", *_YT_COMMON,
         f"https://www.youtube.com/watch?v={video_id}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
