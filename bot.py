@@ -19,6 +19,7 @@ import json
 import secrets
 from urllib.parse import quote, parse_qsl
 
+from aiogram.client.session.aiohttp import AiohttpSession
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,7 +47,8 @@ SERVICE_URL = os.environ.get("SERVICE_URL", "http://localhost:8080")
 PORT = int(os.environ.get("PORT", "8080"))
 PRX = os.environ.get("PRX")
 
-bot = Bot(token=BOT_TOKEN, proxy=PRX)
+session = PRX and AiohttpSession(proxy=PRX)
+bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
 VIDEO_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)([a-zA-Z0-9_-]{11})")
