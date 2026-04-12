@@ -10,6 +10,7 @@ Env vars:
 import os
 import re
 import asyncio
+import logging
 import time
 import tempfile
 import shutil
@@ -18,6 +19,13 @@ import hashlib
 import json
 import secrets
 from urllib.parse import quote, parse_qsl
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("yt-cut")
 
 from aiogram.client.session.aiohttp import AiohttpSession
 from dotenv import load_dotenv
@@ -65,8 +73,11 @@ dp = Dispatcher()
 VIDEO_ID_RE = re.compile(r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)([a-zA-Z0-9_-]{11})")
 
 _CACHE_TTL = 1800
+_BATCH = 30          # segments per ffmpeg job (30 × 4 s = 2 min)
+
 _url_cache: dict[tuple[str, str], tuple[str, float]] = {}
-_hls_cache: dict[tuple, tuple[str, float]] = {}
+# (vid, clip_start, clip_end, kind) → {batch_start_seg: (tmpdir, task|None, created_at)}
+_hls_batches: dict[tuple, dict[int, tuple[str, "asyncio.Task | None", float]]] = {}
 _title_cache: dict[tuple, str] = {}
 _meta_cache: dict[str, tuple[dict, float]] = {}
 
@@ -96,8 +107,11 @@ async def _resolve(video_id: str, kind: str = "video") -> str:
     key = (video_id, kind)
     cached = _url_cache.get(key)
     if cached and now - cached[1] < _CACHE_TTL:
+        log.debug("resolve cache hit: %s/%s", video_id, kind)
         return cached[0]
 
+    log.info("resolve start: %s/%s", video_id, kind)
+    t0 = time.time()
     proc = await asyncio.create_subprocess_exec(
         "yt-dlp", "-f", _FORMATS[kind], "-g", *_YT_COMMON,
         f"https://www.youtube.com/watch?v={video_id}",
@@ -106,62 +120,116 @@ async def _resolve(video_id: str, kind: str = "video") -> str:
     )
     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
     if proc.returncode != 0:
-        raise RuntimeError(stderr.decode().strip())
+        err = stderr.decode().strip()
+        log.error("resolve failed (%.1fs): %s/%s — %s", time.time() - t0, video_id, kind, err)
+        raise RuntimeError(err)
 
     url = stdout.decode().strip().splitlines()[0]
+    log.info("resolve done (%.1fs): %s/%s", time.time() - t0, video_id, kind)
     _url_cache[key] = (url, now)
     return url
 
 
 def _cleanup_hls():
     now = time.time()
-    for key in [k for k, (_, ts) in _hls_cache.items() if now - ts > _CACHE_TTL]:
-        tmpdir, _ = _hls_cache.pop(key)
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    for clip_key, batches in list(_hls_batches.items()):
+        for bs in [b for b, (_, _, ts) in batches.items() if now - ts > _CACHE_TTL]:
+            tmpdir, task, _ = batches.pop(bs)
+            if task and not task.done():
+                task.cancel()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        if not batches:
+            del _hls_batches[clip_key]
 
 
-async def _generate_hls(video_id: str, start: int, end: int, kind: str = "video") -> str:
-    """end=0 means no right trim."""
-    key = (video_id, start, end, kind)
+def _synth_m3u8(ts_base: str, duration: int) -> str:
+    """Full VOD playlist for a known-duration clip (no ffmpeg needed yet)."""
+    seg_time = 4
+    lines = [
+        "#EXTM3U", "#EXT-X-VERSION:3",
+        f"#EXT-X-TARGETDURATION:{seg_time}", "#EXT-X-MEDIA-SEQUENCE:0",
+    ]
+    t = i = 0
+    while t < duration:
+        d = min(seg_time, duration - t)
+        lines += [f"#EXTINF:{d:.6f},", f"{ts_base}?seg={i}"]
+        t += d; i += 1
+    lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines) + "\n"
+
+
+async def _ensure_batch(
+    video_id: str, clip_start: int, clip_end: int, kind: str, batch_start: int,
+) -> tuple[str, "asyncio.Task | None"]:
+    """
+    Ensure an ffmpeg job covering segments [batch_start, batch_start+_BATCH) is running.
+    Each job writes seg0.ts…segN.ts into its own tmpdir; local_seg = global_seg - batch_start.
+    """
+    clip_key = (video_id, clip_start, clip_end, kind)
     _cleanup_hls()
+    batches = _hls_batches.setdefault(clip_key, {})
 
-    cached = _hls_cache.get(key)
-    if cached:
-        return cached[0]
+    if batch_start in batches:
+        tmpdir, task, _ = batches[batch_start]
+        return tmpdir, task
 
     stream_url = await _resolve(video_id, kind)
-    tmpdir = tempfile.mkdtemp(prefix="hls_")
 
-    cmd = [
-        "ffmpeg",
-        "-ss", str(start),
-        "-i", stream_url,
-    ]
-    if end:
-        cmd += ["-t", str(end - start)]
+    # Re-check after yield
+    if batch_start in batches:
+        tmpdir, task, _ = batches[batch_start]
+        return tmpdir, task
+
+    ffmpeg_ss = clip_start + batch_start * 4        # absolute seek position in video
+    batch_end_abs = clip_start + (batch_start + _BATCH) * 4
+    if clip_end:
+        ffmpeg_t = min(clip_end, batch_end_abs) - ffmpeg_ss
+        if ffmpeg_t <= 0:
+            raise RuntimeError(f"Segment {batch_start} is past clip end")
+    else:
+        ffmpeg_t = _BATCH * 4
+
+    tmpdir = tempfile.mkdtemp(prefix="hls_")
+    cmd = ["ffmpeg", "-ss", str(ffmpeg_ss), "-i", stream_url, "-t", str(ffmpeg_t)]
     if kind == "audio":
         cmd += ["-vn"]
     cmd += [
-        "-c", "copy",
-        "-f", "hls",
-        "-hls_time", "4",
+        "-c", "copy", "-f", "hls", "-hls_time", "4",
         "-hls_playlist_type", "vod",
         "-hls_segment_filename", os.path.join(tmpdir, "seg%d.ts"),
         "-loglevel", "error",
         os.path.join(tmpdir, "stream.m3u8"),
     ]
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    log.info("ffmpeg batch start: %s/%s batch=%d (t=%d+%ds) tmpdir=%s",
+             video_id, kind, batch_start, ffmpeg_ss, ffmpeg_t, tmpdir)
+    t0 = time.time()
+    proc = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
 
-    if proc.returncode != 0:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError(stderr.decode().strip())
+    async def _run():
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            batches.pop(batch_start, None)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise RuntimeError("ffmpeg timeout")
+        if proc.returncode != 0:
+            err = stderr.decode().strip()
+            log.error("ffmpeg batch error (%.1fs): %s batch=%d rc=%d — %s",
+                      time.time() - t0, video_id, batch_start, proc.returncode, err)
+            batches.pop(batch_start, None)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise RuntimeError(err or "ffmpeg error")
+        log.info("ffmpeg batch done (%.1fs): %s/%s batch=%d",
+                 time.time() - t0, video_id, kind, batch_start)
+        # mark as complete (task=None keeps the entry alive for TTL cleanup)
+        batches[batch_start] = (tmpdir, None, batches[batch_start][2])
 
-    _hls_cache[key] = (tmpdir, time.time())
-    return tmpdir
+    task = asyncio.create_task(_run())
+    batches[batch_start] = (tmpdir, task, time.time())
+    return tmpdir, task
 
 
 async def handle_stream(request: web.Request) -> web.Response:
@@ -169,6 +237,8 @@ async def handle_stream(request: web.Request) -> web.Response:
     v = request.match_info["v"]
     start = int(request.match_info["start"])
     end = int(request.match_info.get("end") or 0)
+    log.info("stream request: %s start=%s end=%s ua=%s",
+             request.path, start, end, request.headers.get("User-Agent", "")[:60])
 
     if end and end <= start:
         return web.json_response({"error": "end must be greater than start"}, status=400)
@@ -192,20 +262,25 @@ async def handle_stream(request: web.Request) -> web.Response:
         )
         return web.Response(text=html, content_type="text/html")
 
-    try:
-        tmpdir = await _generate_hls(v, start, end, kind)
-    except RuntimeError as e:
-        return web.json_response({"error": str(e)}, status=502)
-
-    with open(os.path.join(tmpdir, "stream.m3u8")) as f:
-        m3u8 = f.read()
-
     ts_base = SERVICE_URL + _ts_path(v, start, end, kind)
-    m3u8 = re.sub(
-        r"seg(\d+)\.ts",
-        lambda m: f"{ts_base}?seg={m.group(1)}",
-        m3u8,
-    )
+
+    if end:
+        # Duration known → full VOD playlist immediately; batches start on first TS request.
+        m3u8 = _synth_m3u8(ts_base, end - start)
+        log.info("stream: synthetic m3u8 %d segs", (end - start + 3) // 4)
+    else:
+        # Duration unknown → must wait for ffmpeg to finish batch 0.
+        try:
+            tmpdir, task = await _ensure_batch(v, start, end, kind, 0)
+            if task is not None:
+                await task
+            tmpdir, _, _ = _hls_batches[(v, start, end, kind)][0]
+        except RuntimeError as e:
+            return web.json_response({"error": str(e)}, status=502)
+        with open(os.path.join(tmpdir, "stream.m3u8")) as f:
+            m3u8 = f.read()
+        m3u8 = re.sub(r"seg(\d+)\.ts", lambda m: f"{ts_base}?seg={m.group(1)}", m3u8)
+        log.info("stream: m3u8 from disk (end=0)")
 
     return web.Response(text=m3u8, content_type="application/vnd.apple.mpegurl")
 
@@ -220,15 +295,48 @@ async def handle_ts(request: web.Request) -> web.Response:
     if seg is None:
         return web.json_response({"error": "Required param: seg"}, status=400)
 
-    cached = _hls_cache.get((v, start, end, kind))
-    if not cached:
-        return web.json_response({"error": "Session expired, reload playlist"}, status=404)
+    seg_n = int(seg)
+    batch_start = (seg_n // _BATCH) * _BATCH
+    local_seg = seg_n - batch_start
 
-    ts_path = os.path.join(cached[0], f"seg{seg}.ts")
-    if not os.path.isfile(ts_path):
-        return web.json_response({"error": "Segment not found"}, status=404)
+    log.debug("ts request: seg=%d batch=%d local=%d", seg_n, batch_start, local_seg)
+    t0 = time.time()
 
-    return web.FileResponse(ts_path, headers={"Content-Type": "video/mp2t"})
+    try:
+        tmpdir, task = await _ensure_batch(v, start, end, kind, batch_start)
+    except RuntimeError as e:
+        log.error("ts seg=%d: batch start failed: %s", seg_n, e)
+        return web.json_response({"error": str(e)}, status=502)
+
+    ts_path = os.path.join(tmpdir, f"seg{local_seg}.ts")
+    next_path = os.path.join(tmpdir, f"seg{local_seg + 1}.ts")
+    m3u8_path = os.path.join(tmpdir, "stream.m3u8")
+
+    # With VOD mode, ffmpeg closes seg[N] before opening seg[N+1], so seg[N] is
+    # fully written when seg[N+1] exists or stream.m3u8 exists (ffmpeg finished).
+    for i in range(120):  # up to 60 s
+        if os.path.isfile(ts_path):
+            if os.path.isfile(next_path) or os.path.isfile(m3u8_path) or task is None or (task is not None and task.done()):
+                size = os.path.getsize(ts_path)
+                waited = time.time() - t0
+                if waited > 0.3:
+                    log.info("ts seg=%d ready after %.1fs size=%d", seg_n, waited, size)
+                else:
+                    log.debug("ts seg=%d size=%d", seg_n, size)
+                return web.FileResponse(ts_path, headers={"Content-Type": "video/mp2t"})
+        if task is not None and task.done():
+            if task.exception():
+                log.error("ts seg=%d: ffmpeg failed: %s", seg_n, task.exception())
+                return web.json_response({"error": str(task.exception())}, status=502)
+            if not os.path.isfile(ts_path):
+                log.warning("ts seg=%d: ffmpeg done, file missing", seg_n)
+                break
+        if i % 10 == 0:
+            log.debug("ts seg=%d: waiting... (%.1fs)", seg_n, time.time() - t0)
+        await asyncio.sleep(0.5)
+
+    log.error("ts seg=%d: not found after %.1fs", seg_n, time.time() - t0)
+    return web.json_response({"error": "Segment not found"}, status=404)
 
 
 # ── Mini App API ─────────────────────────────────────────────────────────────
